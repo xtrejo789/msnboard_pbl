@@ -760,27 +760,28 @@ void FLASH_WriteLogToMissionFlash(void)
     if (gyro_count == 0) return;
 
     uint32_t file_size = gyro_count * sizeof(GyroSample);
-    if (file_size > FLASH_SLOT_SIZE - 4) return; // seguridad
+    if (file_size > FLASH_SLOT_SIZE - 0x10) return; // leave space for 16B header
 
     uint32_t addr = GYRO_BASE_ADDR;
 
-    /* flag to indicate data is being stored */
-    flag_flash_saving = 1;
+    flag_flash_saving = 1;  // for STS
 
+    // 1) erase slot of 4 MiB
     for (uint32_t a = addr; a < (addr + FLASH_SLOT_SIZE); a += FLASH_SECTOR_SIZE)
         FLASH_SectorErase(a);
 
-    // header with the file's size
-    uint8_t header[4] = {
-        (file_size & 0xFF),
-        ((file_size >> 8) & 0xFF),
-        ((file_size >> 16) & 0xFF),
-        ((file_size >> 24) & 0xFF)
-    };
-    FLASH_PageProgram(addr, header, 4);
-    addr += 4;
+    // 2) header with 16 bytes (4 of size + 12 reserved)
+    uint8_t header[16] = {0};
 
-    // complete log
+    header[0] = (file_size & 0xFF);
+    header[1] = (file_size >> 8) & 0xFF;
+    header[2] = (file_size >> 16) & 0xFF;
+    header[3] = (file_size >> 24) & 0xFF;
+
+    FLASH_PageProgram(addr, header, sizeof(header));
+    addr += sizeof(header);  // offset for gyroscope's data
+
+    // 3) write gyroscope's logs starting from 0x10
     const uint8_t *p = (uint8_t*)gyro_log;
     uint32_t remaining = file_size;
 
@@ -796,10 +797,8 @@ void FLASH_WriteLogToMissionFlash(void)
         remaining -= chunk;
     }
 
-    /* storing has ended */
     flag_flash_saving = 0;
-
-    UART_Print("Gyro Log saved to Mission Flash!\r\n");
+    UART_Print("Gyro Log saved to Mission Flash (with 16-byte header)!\r\n");
 }
 
 /* Construye el inner "STSEEB0B1B2" dinámicamente */
