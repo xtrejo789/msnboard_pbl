@@ -96,6 +96,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_USART3_UART_Init(void);
+bool FLASH_Probe(void);
 /* USER CODE BEGIN PFP */
 /* Prototipos de utilidades y sensor */
 void UART_Print(char *msg);
@@ -111,12 +112,12 @@ void handle_cam_command(const char *inner_cmd);
 void CheckOBC_Task(void);
 
 /* Prototypes for FM*/
-void FLASH_WriteEnable(void);
-void FLASH_WaitBusy(void);
-void FLASH_SectorErase(uint32_t addr);
-void FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len);
+bool FLASH_WriteEnable(void);
+bool FLASH_WaitBusy(uint32_t timeout_ms);
+bool FLASH_SectorErase(uint32_t addr);
+bool FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len);
 void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len);
-void FLASH_WriteLogToMissionFlash(void);
+bool FLASH_WriteLogToMissionFlash(void);
 static void build_STS_inner(char *inner, size_t inner_size);
 
 /* USER CODE END PFP */
@@ -174,12 +175,12 @@ int main(void)
   MX_SPI2_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  UART_Print("System Initialized\r\n");
+  //UART_Print("System Initialized\r\n");
   L3G4200D_Init();
-  UART_Print("Gyro Initialized\r\n");
-  UART_Print("Keep still for bias calib...\r\n");
+  //UART_Print("Gyro Initialized\r\n");
+  //UART_Print("Keep still for bias calib...\r\n");
   Gyro_Calibrate(200);
-  UART_Print("Bias calibrated.\r\n");
+  //UART_Print("Bias calibrated.\r\n");
 
   /* USER CODE END 2 */
 
@@ -212,7 +213,7 @@ int main(void)
       /* 2️ check for OBC commands */
       CheckOBC_Task();
 
-      HAL_Delay(100);
+      //HAL_Delay(100);
   }
 
     /* USER CODE END WHILE */
@@ -475,10 +476,34 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+bool FLASH_Probe(void)
+{
+    uint8_t cmd = FLASH_CMD_RDID;
+    uint8_t id[3] = {0};
+
+    FLASH_CS_LOW();
+    if (HAL_SPI_Transmit(&hspi2, &cmd, 1, 100) != HAL_OK) {
+        FLASH_CS_HIGH();
+        return false;
+    }
+    if (HAL_SPI_Receive(&hspi2, id, 3, 100) != HAL_OK) {
+        FLASH_CS_HIGH();
+        return false;
+    }
+    FLASH_CS_HIGH();
+
+    // Si NO hay flash / línea flotante: típico 0xFF 0xFF 0xFF o 0x00 0x00 0x00
+    if ((id[0]==0xFF && id[1]==0xFF && id[2]==0xFF) ||
+        (id[0]==0x00 && id[1]==0x00 && id[2]==0x00)) {
+        return false;
+    }
+
+    return true;
+}
 /* ======== Utilidades UART/I2C y manejo de giroscopio ======== */
 void UART_Print(char *msg)
 {
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 }
 
 uint8_t I2C_ReadByte(uint8_t reg)
@@ -497,11 +522,11 @@ void L3G4200D_Init(void)
 {
     uint8_t who = I2C_ReadByte(L3G4200D_WHO_AM_I);
     if (who != 0xD3) {
-        UART_Print("L3G4200D not found! WHO_AM_I failed.\r\n");
+        //UART_Print("L3G4200D not found! WHO_AM_I failed.\r\n");
         gyro_ok = false;
         return;
     } else {
-        UART_Print("L3G4200D detected successfully.\r\n");
+        //UART_Print("L3G4200D detected successfully.\r\n");
         gyro_ok = true;
     }
 
@@ -600,7 +625,7 @@ void handle_cam_command(const char *inner_cmd)
     uint8_t tx_buf[CAM_MSG_LEN];
 
     snprintf(msg, sizeof(msg), "CMD from PIC: %s\r\n", inner_cmd);
-    UART_Print(msg);
+    //UART_Print(msg);
 
     if (strncmp(inner_cmd, "STS", 3) == 0) {
 
@@ -614,9 +639,8 @@ void handle_cam_command(const char *inner_cmd)
 
     } else if (strncmp(inner_cmd, "CAP", 3) == 0) {
 
-        // Guardar log actual a Mission Flash
-        FLASH_WriteLogToMissionFlash();
-        cam_build_response("CAP00", tx_buf);
+        bool ok = FLASH_WriteLogToMissionFlash();
+        cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
 
     } else if (strncmp(inner_cmd, "JPG", 3) == 0) {
 
@@ -663,7 +687,7 @@ void CheckOBC_Task(void)
     uint8_t rx_buf[CAM_MSG_LEN];
     char    inner[CAM_MSG_LEN];
 
-    if (HAL_UART_Receive(&huart_cam, rx_buf, CAM_MSG_LEN, 5) != HAL_OK)
+    if (HAL_UART_Receive(&huart_cam, rx_buf, CAM_MSG_LEN, 200) != HAL_OK)
         return;
 
     if (rx_buf[0] != OBC_HEADER) return;
@@ -686,58 +710,75 @@ void CheckOBC_Task(void)
     handle_cam_command(inner);
 }
 
-void FLASH_WriteEnable(void)
+bool FLASH_WriteEnable(void)
 {
     uint8_t cmd = FLASH_CMD_WREN;
     FLASH_CS_LOW();
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    if (HAL_SPI_Transmit(&hspi2, &cmd, 1, 100) != HAL_OK) { FLASH_CS_HIGH(); return false; }
     FLASH_CS_HIGH();
+    return true;
 }
 
-void FLASH_WaitBusy(void)
+bool FLASH_WaitBusy(uint32_t timeout_ms)
 {
     uint8_t cmd = FLASH_CMD_RDSR;
     uint8_t status = 0x01;
+    uint32_t t0 = HAL_GetTick();
 
-    do {
+    while (1) {
         FLASH_CS_LOW();
-        HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-        HAL_SPI_Receive(&hspi2, &status, 1, 100);
+        if (HAL_SPI_Transmit(&hspi2, &cmd, 1, 100) != HAL_OK) {
+            FLASH_CS_HIGH();
+            return false;
+        }
+        if (HAL_SPI_Receive(&hspi2, &status, 1, 100) != HAL_OK) {
+            FLASH_CS_HIGH();
+            return false;
+        }
         FLASH_CS_HIGH();
-    } while (status & 0x01);
+
+        if ((status & 0x01) == 0) return true;              // no busy
+        if ((HAL_GetTick() - t0) > timeout_ms) return false; // timeout
+    }
 }
 
-void FLASH_SectorErase(uint32_t addr)
+bool FLASH_SectorErase(uint32_t addr)
 {
-    uint8_t cmd[5];
-    cmd[0] = FLASH_CMD_ERASE_SECT;
-    cmd[1] = (addr >> 24) & 0xFF;
-    cmd[2] = (addr >> 16) & 0xFF;
-    cmd[3] = (addr >> 8) & 0xFF;
-    cmd[4] = (addr >> 0) & 0xFF;
+    uint8_t cmd[5] = {
+        FLASH_CMD_ERASE_SECT,
+        (addr >> 24) & 0xFF,
+        (addr >> 16) & 0xFF,
+        (addr >>  8) & 0xFF,
+        (addr >>  0) & 0xFF
+    };
 
-    FLASH_WriteEnable();
+    if (!FLASH_WriteEnable()) return false;
+
     FLASH_CS_LOW();
-    HAL_SPI_Transmit(&hspi2, cmd, 5, 200);
+    if (HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK) { FLASH_CS_HIGH(); return false; }
     FLASH_CS_HIGH();
-    FLASH_WaitBusy();
+
+    return FLASH_WaitBusy(5000);
 }
 
-void FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len)
+bool FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len)
 {
-    uint8_t cmd[5];
-    cmd[0] = FLASH_CMD_PP;
-    cmd[1] = (addr >> 24) & 0xFF;
-    cmd[2] = (addr >> 16) & 0xFF;
-    cmd[3] = (addr >> 8) & 0xFF;
-    cmd[4] = (addr >> 0) & 0xFF;
+    uint8_t cmd[5] = {
+        FLASH_CMD_PP,
+        (addr >> 24) & 0xFF,
+        (addr >> 16) & 0xFF,
+        (addr >>  8) & 0xFF,
+        (addr >>  0) & 0xFF
+    };
 
-    FLASH_WriteEnable();
+    if (!FLASH_WriteEnable()) return false;
+
     FLASH_CS_LOW();
-    HAL_SPI_Transmit(&hspi2, cmd, 5, 200);
-    HAL_SPI_Transmit(&hspi2, (uint8_t*)data, len, 200);
+    if (HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK) { FLASH_CS_HIGH(); return false; }
+    if (HAL_SPI_Transmit(&hspi2, (uint8_t*)data, len, 200) != HAL_OK) { FLASH_CS_HIGH(); return false; }
     FLASH_CS_HIGH();
-    FLASH_WaitBusy();
+
+    return FLASH_WaitBusy(2000);
 }
 
 void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len)
@@ -755,42 +796,52 @@ void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len)
     FLASH_CS_HIGH();
 }
 
-void FLASH_WriteLogToMissionFlash(void)
+bool FLASH_WriteLogToMissionFlash(void)
 {
-    if (gyro_count == 0) return;
+    if (gyro_count == 0) return false;
+
+    // 1) Verifica que la flash exista (RDID válido)
+    if (!FLASH_Probe()) return false;
 
     uint32_t file_size = gyro_count * sizeof(GyroSample);
-    if (file_size > FLASH_SLOT_SIZE - 0x10) return; // leave space for 16B header
+    if (file_size > (FLASH_SLOT_SIZE - 0x10)) return false;
 
     uint32_t addr = GYRO_BASE_ADDR;
+    flag_flash_saving = 1;
 
-    flag_flash_saving = 1;  // for STS
+    // 2) Erase de todo el slot
+    for (uint32_t a = addr; a < (addr + FLASH_SLOT_SIZE); a += FLASH_SECTOR_SIZE) {
+        if (!FLASH_SectorErase(a)) {
+            flag_flash_saving = 0;
+            return false;
+        }
+    }
 
-    // 1) erase slot of 4 MiB
-    for (uint32_t a = addr; a < (addr + FLASH_SLOT_SIZE); a += FLASH_SECTOR_SIZE)
-        FLASH_SectorErase(a);
-
-    // 2) header with 16 bytes (4 of size + 12 reserved)
+    // 3) Header 16B
     uint8_t header[16] = {0};
-
     header[0] = (file_size & 0xFF);
     header[1] = (file_size >> 8) & 0xFF;
     header[2] = (file_size >> 16) & 0xFF;
     header[3] = (file_size >> 24) & 0xFF;
 
-    FLASH_PageProgram(addr, header, sizeof(header));
-    addr += sizeof(header);  // offset for gyroscope's data
+    if (!FLASH_PageProgram(addr, header, sizeof(header))) {
+        flag_flash_saving = 0;
+        return false;
+    }
+    addr += sizeof(header);
 
-    // 3) write gyroscope's logs starting from 0x10
-    const uint8_t *p = (uint8_t*)gyro_log;
+    // 4) Datos
+    const uint8_t *p = (const uint8_t*)gyro_log;
     uint32_t remaining = file_size;
 
-    while (remaining > 0)
-    {
+    while (remaining > 0) {
         uint32_t page_remain = FLASH_PAGE_SIZE - (addr % FLASH_PAGE_SIZE);
         uint32_t chunk = (remaining < page_remain) ? remaining : page_remain;
 
-        FLASH_PageProgram(addr, p, chunk);
+        if (!FLASH_PageProgram(addr, p, chunk)) {
+            flag_flash_saving = 0;
+            return false;
+        }
 
         addr      += chunk;
         p         += chunk;
@@ -798,7 +849,7 @@ void FLASH_WriteLogToMissionFlash(void)
     }
 
     flag_flash_saving = 0;
-    UART_Print("Gyro Log saved to Mission Flash (with 16-byte header)!\r\n");
+    return true;
 }
 
 /* Construye el inner "STSEEB0B1B2" dinámicamente */
