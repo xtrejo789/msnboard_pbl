@@ -63,7 +63,12 @@ volatile uint8_t flag_capture_active   = 0;  // B0: logging de giroscopio
 volatile uint8_t flag_flash_saving     = 0;  // B1: guardando en MSFM
 volatile uint8_t flag_data_transfer    = 0;  // B2: transferencia (no usada aquí)
 
-#define huart_cam huart3
+// UART routing
+#define UART_PC   huart2   // Laptop / ST-Link VCP (debug)
+#define UART_OBC  huart3   // Link hacia OBC (commands/responses)
+
+// Antes tenías esto:
+#define huart_cam huart3   // <-- quítalo para que no confunda
 
 #define FLASH_CS_PORT     GPIOB
 #define FLASH_CS_PIN      GPIO_PIN_12   // Adjust
@@ -99,7 +104,8 @@ static void MX_USART3_UART_Init(void);
 bool FLASH_Probe(void);
 /* USER CODE BEGIN PFP */
 /* Prototipos de utilidades y sensor */
-void UART_Print(char *msg);
+static void PC_Print(const char *s);
+static void PC_PrintHex64(const char *tag, const uint8_t *buf);
 uint8_t I2C_ReadByte(uint8_t reg);
 void I2C_WriteByte(uint8_t reg, uint8_t value);
 void L3G4200D_Init(void);
@@ -501,9 +507,23 @@ bool FLASH_Probe(void)
     return true;
 }
 /* ======== Utilidades UART/I2C y manejo de giroscopio ======== */
-void UART_Print(char *msg)
+static void PC_Print(const char *s)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+    HAL_UART_Transmit(&UART_PC, (uint8_t*)s, strlen(s), 50);
+}
+
+static void PC_PrintHex64(const char *tag, const uint8_t *buf)
+{
+    char line[256];
+    int n = 0;
+
+    n += snprintf(line+n, sizeof(line)-n, "%s", tag);
+    for (int i = 0; i < CAM_MSG_LEN; i++) {
+        n += snprintf(line+n, sizeof(line)-n, "%02X ", buf[i]);
+        if (n >= (int)sizeof(line)-4) break;
+    }
+    n += snprintf(line+n, sizeof(line)-n, "\r\n");
+    PC_Print(line);
 }
 
 uint8_t I2C_ReadByte(uint8_t reg)
@@ -624,8 +644,8 @@ void handle_cam_command(const char *inner_cmd)
 {
     uint8_t tx_buf[CAM_MSG_LEN];
 
-    snprintf(msg, sizeof(msg), "CMD from PIC: %s\r\n", inner_cmd);
-    //UART_Print(msg);
+    snprintf(msg, sizeof(msg), "CMD from OBC: %s\r\n", inner_cmd);
+    PC_Print(msg);
 
     if (strncmp(inner_cmd, "STS", 3) == 0) {
 
@@ -678,7 +698,11 @@ void handle_cam_command(const char *inner_cmd)
         cam_build_response("RST01", tx_buf);
     }
 
-    HAL_UART_Transmit(&huart_cam, tx_buf, CAM_MSG_LEN, 100);
+    // Send answer to OBC
+    HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 100);
+
+    // Debug for personal laptop
+    PC_PrintHex64("[TX->OBC] ", tx_buf);
 }
 
 
@@ -687,21 +711,24 @@ void CheckOBC_Task(void)
     uint8_t rx_buf[CAM_MSG_LEN];
     char    inner[CAM_MSG_LEN];
 
-    if (HAL_UART_Receive(&huart_cam, rx_buf, CAM_MSG_LEN, 200) != HAL_OK)
+    // Importante: timeout corto para no “congelar” tu loop
+    if (HAL_UART_Receive(&UART_OBC, rx_buf, CAM_MSG_LEN, 5) != HAL_OK)
         return;
+
+    PC_PrintHex64("[RX<-OBC] ", rx_buf);
 
     if (rx_buf[0] != OBC_HEADER) return;
 
     int footer = -1;
     for (int i = 1; i < CAM_MSG_LEN; i++) {
-        if (rx_buf[i] == (OBC_HEADER + 1)) { // 0x0C
+        if (rx_buf[i] == (OBC_HEADER + 1)) {
             footer = i;
             break;
         }
     }
     if (footer < 0) return;
 
-    int inner_len = footer - 1 - 2; // -2 because of checksum
+    int inner_len = footer - 1 - 2;
     if (inner_len <= 0 || inner_len >= CAM_MSG_LEN) return;
 
     memcpy(inner, &rx_buf[1], inner_len);
