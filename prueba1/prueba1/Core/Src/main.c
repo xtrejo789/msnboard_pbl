@@ -76,7 +76,7 @@ volatile uint8_t flag_data_transfer    = 0;  // B2: transferencia (no usada aqu�
 #define FLASH_SECTOR_SIZE   (64UL*1024UL)
 #define FLASH_PAGE_SIZE     (4UL*1024UL)
 #define FLASH_SLOT_SIZE     (4UL*1024*1024UL)  // mem_block_size del PIC
-#define GYRO_SLOT_INDEX     0
+#define GYRO_SLOT_INDEX     1
 #define GYRO_BASE_ADDR      (GYRO_SLOT_INDEX * FLASH_SLOT_SIZE)
 
 // Opcodes according to Main PIC's code
@@ -115,7 +115,7 @@ void log_current_gyro(uint32_t t_ms, int16_t gx, int16_t gy, int16_t gz);
 uint8_t cam_checksum(const char *s);
 void cam_build_response(const char *inner, uint8_t *out);
 void handle_cam_command(const char *inner_cmd);
-void CheckOBC_Task(void);
+void CheckOBC_Task(uint32_t timeout_ms);
 
 /* Prototypes for FM*/
 bool FLASH_WriteEnable(void);
@@ -140,6 +140,9 @@ typedef struct __attribute__((packed)) {
 #define MAX_SAMPLES 6000
 GyroSample gyro_log[MAX_SAMPLES];
 uint32_t   gyro_count = 0;
+
+volatile uint8_t pending_flash_write = 0;
+volatile uint8_t last_cap_result_ok = 1; // opcional
 
 // MSN (UART)
 #define CAM_MSG_LEN 64
@@ -199,27 +202,35 @@ int main(void)
 
       uint32_t now_ms = HAL_GetTick();
       if (t0_ms == 0) {
-          t0_ms = now_ms;   // time reference for samples
+          t0_ms = now_ms;
       }
 
-      /* 1️ logging to RAM */
+      /* 1) Log a RAM (gyro) */
       if (gyro_ok && gyro_count < MAX_SAMPLES) {
-          flag_capture_active = 1;   // capturing data
-          if (L3G4200D_ReadGyro(&gyro_x, &gyro_y, &gyro_z)) {
-              int16_t gx_corr = gyro_x - bias_x;
-              int16_t gy_corr = gyro_y - bias_y;
-              int16_t gz_corr = gyro_z - bias_z;
+          flag_capture_active = 1;
 
-              log_current_gyro(now_ms - t0_ms, gx_corr, gy_corr, gz_corr);
+          if (L3G4200D_ReadGyro(&gyro_x, &gyro_y, &gyro_z)) {
+              log_current_gyro(
+                  now_ms - t0_ms,
+                  gyro_x - bias_x,
+                  gyro_y - bias_y,
+                  gyro_z - bias_z
+              );
           }
       } else {
-          flag_capture_active = 0;   // full buffer or sensor is not OK
+          flag_capture_active = 0;
       }
 
-      /* 2️ check for OBC commands */
-      CheckOBC_Task();
+      /* 2) Escritura a flash (CAP) */
+      if (pending_flash_write) {
+          pending_flash_write = 0;
 
-      //HAL_Delay(100);
+          bool ok = FLASH_WriteLogToMissionFlash();
+          last_cap_result_ok = ok ? 1 : 0;
+      }
+
+      /* 3) Atender comandos OBC (bloquea hasta timeout_ms) */
+      CheckOBC_Task(200);
   }
 
     /* USER CODE END WHILE */
@@ -659,8 +670,15 @@ void handle_cam_command(const char *inner_cmd)
 
     } else if (strncmp(inner_cmd, "CAP", 3) == 0) {
 
-        bool ok = FLASH_WriteLogToMissionFlash();
-        cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
+        // 1) ACK inmediato al Main PIC
+        cam_build_response("CAP00", tx_buf);
+        HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 100);
+
+        // 2) Agenda la escritura
+        flag_flash_saving = 1;
+        pending_flash_write = 1;
+
+        return;
 
     } else if (strncmp(inner_cmd, "JPG", 3) == 0) {
 
@@ -705,26 +723,20 @@ void handle_cam_command(const char *inner_cmd)
     PC_PrintHex64("[TX->OBC] ", tx_buf);
 }
 
-
-void CheckOBC_Task(void)
+// Makes sure Payload sends STS even while it is writing data to MSFM
+void CheckOBC_Task(uint32_t timeout_ms)
 {
     uint8_t rx_buf[CAM_MSG_LEN];
     char    inner[CAM_MSG_LEN];
 
-    // Importante: timeout corto para no “congelar” tu loop
-    if (HAL_UART_Receive(&UART_OBC, rx_buf, CAM_MSG_LEN, 5) != HAL_OK)
+    if (HAL_UART_Receive(&UART_OBC, rx_buf, CAM_MSG_LEN, timeout_ms) != HAL_OK)
         return;
-
-    PC_PrintHex64("[RX<-OBC] ", rx_buf);
 
     if (rx_buf[0] != OBC_HEADER) return;
 
     int footer = -1;
     for (int i = 1; i < CAM_MSG_LEN; i++) {
-        if (rx_buf[i] == (OBC_HEADER + 1)) {
-            footer = i;
-            break;
-        }
+        if (rx_buf[i] == (OBC_HEADER + 1)) { footer = i; break; }
     }
     if (footer < 0) return;
 
@@ -736,6 +748,7 @@ void CheckOBC_Task(void)
 
     handle_cam_command(inner);
 }
+
 
 bool FLASH_WriteEnable(void)
 {
@@ -842,6 +855,7 @@ bool FLASH_WriteLogToMissionFlash(void)
             flag_flash_saving = 0;
             return false;
         }
+        CheckOBC_Task(5);
     }
 
     // 3) Header 16B
@@ -869,6 +883,8 @@ bool FLASH_WriteLogToMissionFlash(void)
             flag_flash_saving = 0;
             return false;
         }
+
+        CheckOBC_Task(5);
 
         addr      += chunk;
         p         += chunk;
