@@ -1,189 +1,230 @@
 import serial
 import time
+from dataclasses import dataclass
 
 # ====== CONFIG ======
 PORT = "COM3"
 BAUD = 9600
-TIMEOUT = 0.5
+TIMEOUT = 0.1
 
 CAM_MSG_LEN = 64
-OBC_HEADER = 0x0B      # payload espera 0x0B al inicio
-OBC_FOOTER = 0x0C      # payload busca 0x0C como footer (0x0B + 1)
+OBC_HEADER = 0x0B      # OBC -> Payload
+CAM_HEADER = 0xCA      # Payload -> OBC
+
+STS_PERIOD_S = 0.25     # cada cuánto mandar STS durante preflight
+READ_TIMEOUT_S = 1.5    # timeout para recibir 64 bytes
+
+INTER_CMD_DELAY_S = 0.4  # delay entre comandos en la secuencia
+RETRIES_PER_CMD = 3       # reintentos por comando si falla parse/checksum
+
+READ_TIMEOUT_CAP_S = 60.0   # o 90.0 si quieres más margen
+
 # ====================
+def read_frame_sync(ser: serial.Serial, header: int, timeout_s: float) -> bytes | None:
+    t0 = time.time()
+    while (time.time() - t0) < timeout_s:
+        b = ser.read(1)
+        if not b or b[0] != header:
+            continue
+        rest = ser.read(CAM_MSG_LEN - 1)
+        if len(rest) == CAM_MSG_LEN - 1:
+            return bytes([header]) + rest
+    return None
 
-
-def xor_checksum_ascii(s: str) -> int:
+def cam_checksum_xor(s: str) -> int:
     c = 0
     for ch in s:
         c ^= ord(ch) & 0xFF
-    return c
+    return c & 0xFF
 
 
-def build_obc_frame(inner_cmd: str) -> bytes:
-    """
-    Frame format expected by payload:
-    [0]   = 0x0B
-    [1..] = ASCII inner_cmd
-    next  = 2 ASCII HEX bytes checksum of inner_cmd (XOR)
-    next  = 0x0C
-    rest  = 0x00 padding to 64 bytes
-    """
-    inner_cmd = inner_cmd.strip()
-    cs = xor_checksum_ascii(inner_cmd)
-    cs_ascii = f"{cs:02X}"  # 2 chars
+def cam_generate_cmd(header: int, inner: str) -> bytes:
+    inner = inner.strip()
+    cs = cam_checksum_xor(inner)
+    cs_ascii = f"{cs:02X}"
 
-    payload = bytearray()
-    payload.append(OBC_HEADER)
-    payload.extend(inner_cmd.encode("ascii"))
-    payload.extend(cs_ascii.encode("ascii"))
-    payload.append(OBC_FOOTER)
+    out = bytearray(CAM_MSG_LEN)
+    out[0] = header
 
-    # pad to 64 bytes
-    if len(payload) > CAM_MSG_LEN:
-        raise ValueError(f"Frame too long ({len(payload)} bytes). Inner cmd too long.")
-    payload.extend(b"\x00" * (CAM_MSG_LEN - len(payload)))
-    return bytes(payload)
+    inner_b = inner.encode("ascii")
+    if 1 + len(inner_b) + 2 + 1 > CAM_MSG_LEN:
+        raise ValueError("Inner demasiado largo para frame de 64 bytes.")
+
+    out[1:1 + len(inner_b)] = inner_b
+    out[1 + len(inner_b):1 + len(inner_b) + 2] = cs_ascii.encode("ascii")
+    out[1 + len(inner_b) + 2] = (header + 1) & 0xFF  # footer
+    return bytes(out)
 
 
-def parse_payload_response(frame: bytes) -> dict:
-    """
-    Payload response format (from cam_build_response):
-    [0]   = 0xCA
-    [1..] = ASCII inner response
-    next  = 2 ASCII HEX checksum (XOR of inner response)
-    next  = 0xCB
-    rest  = padding zeros
-    """
+@dataclass
+class ParsedFrame:
+    ok: bool
+    error: str = ""
+    inner: str = ""
+    cs_rx: int = 0
+    cs_calc: int = 0
+    raw: bytes = b""
+
+
+def parse_cam_frame(expected_header: int, frame: bytes) -> ParsedFrame:
     if len(frame) != CAM_MSG_LEN:
-        return {"ok": False, "error": f"Bad length {len(frame)}"}
+        return ParsedFrame(False, f"Bad length: {len(frame)}", raw=frame)
 
-    header = frame[0]
-    footer = frame.find(bytes([0xCB]))
-    if header != 0xCA or footer == -1:
-        return {"ok": False, "error": "Not a valid payload response (missing 0xCA/0xCB)"}
+    if frame[0] != expected_header:
+        return ParsedFrame(False, f"Bad header 0x{frame[0]:02X} (expected 0x{expected_header:02X})", raw=frame)
 
-    # inner ends 2 bytes before footer (checksum)
-    if footer < 1 + 2:
-        return {"ok": False, "error": "Footer too early"}
+    footer_byte = (expected_header + 1) & 0xFF
+    footer_idx = frame.find(bytes([footer_byte]), 1)
+    if footer_idx == -1:
+        return ParsedFrame(False, f"Footer 0x{footer_byte:02X} not found", raw=frame)
 
-    inner_end = footer - 2
-    inner_bytes = frame[1:inner_end]
-    cs_ascii = frame[inner_end:footer].decode("ascii", errors="replace")
+    if footer_idx < 1 + 2:
+        return ParsedFrame(False, "Footer too early", raw=frame)
 
-    inner = inner_bytes.decode("ascii", errors="replace")
+    cs_ascii = frame[footer_idx - 2:footer_idx].decode("ascii", errors="replace")
     try:
         cs_rx = int(cs_ascii, 16)
     except ValueError:
-        return {"ok": False, "error": f"Bad checksum ASCII: {cs_ascii}", "inner": inner}
+        return ParsedFrame(False, f"Bad checksum ASCII: {cs_ascii!r}", raw=frame)
 
-    cs_calc = xor_checksum_ascii(inner)
-    return {
-        "ok": (cs_rx == cs_calc),
-        "inner": inner,
-        "cs_rx": cs_rx,
-        "cs_calc": cs_calc,
-        "raw": frame,
-    }
+    inner_bytes = frame[1:footer_idx - 2]
+    inner = inner_bytes.decode("ascii", errors="replace")
 
+    cs_calc = cam_checksum_xor(inner)
+    if cs_rx != cs_calc:
+        return ParsedFrame(False, "Checksum mismatch", inner=inner, cs_rx=cs_rx, cs_calc=cs_calc, raw=frame)
 
-def send_and_read(ser: serial.Serial, inner_cmd: str, read_timeout_s: float = 1.5) -> None:
-    tx = build_obc_frame(inner_cmd)
+    return ParsedFrame(True, inner=inner, cs_rx=cs_rx, cs_calc=cs_calc, raw=frame)
 
-    print("[TX] Raw:", tx.hex(" "))             # <-- ADD THIS
+def send_cmd(ser: serial.Serial, inner_cmd: str, read_timeout_s: float = READ_TIMEOUT_S) -> ParsedFrame:
+    tx = cam_generate_cmd(OBC_HEADER, inner_cmd)
 
-    ser.reset_input_buffer()
+    # ❌ NO hagas esto:
+    # ser.reset_input_buffer()
+
     ser.write(tx)
     ser.flush()
 
-    t0 = time.time()
-    rx = bytearray()
-    while len(rx) < CAM_MSG_LEN and (time.time() - t0) < read_timeout_s:
-        chunk = ser.read(CAM_MSG_LEN - len(rx))
-        if chunk:
-            rx.extend(chunk)
+    rx = read_frame_sync(ser, CAM_HEADER, timeout_s=read_timeout_s)
+    if rx is None:
+        return ParsedFrame(False, f"RX timeout/incomplete (<{CAM_MSG_LEN} bytes)")
 
-    if len(rx) != CAM_MSG_LEN:
-        print(f"[RX] Timeout / incomplete frame: got {len(rx)} bytes")
-        if rx:
-            print("[RX] Raw:", rx.hex(" "))     # (already similar)
-        return
+    parsed = parse_cam_frame(CAM_HEADER, rx)
+    if not parsed.ok:
+        parsed.raw = rx
+    return parsed
 
-    print("[RX] Raw:", bytes(rx).hex(" "))      # <-- ADD THIS
-    print("[RX] First16:", bytes(rx[:16]).hex(" "))  # <-- ADD THIS
+def is_sts_ok(inner: str) -> bool:
+    """
+    Tu payload arma: "STS%02X%c%c%c"
+    Queremos EE == 00 para 'todo bien'.
+    """
+    if not inner.startswith("STS") or len(inner) < 5:
+        return False
+    ee_hex = inner[3:5]
+    try:
+        ee = int(ee_hex, 16)
+    except ValueError:
+        return False
+    return ee == 0x00
 
-    resp = parse_payload_response(bytes(rx))
 
-    if not resp["ok"]:
-        print("[RX] Invalid/failed response:", resp.get("error", "checksum mismatch"))
-        if "inner" in resp:
-            print("     inner:", resp["inner"])
-        if "cs_rx" in resp:
-            print(f"     cs_rx={resp['cs_rx']:02X} cs_calc={resp['cs_calc']:02X}")
-    else:
-        print("[RX] OK  inner:", resp["inner"])
-        print(f"     cs={resp['cs_rx']:02X}")
+def preflight_wait_sts_ok(ser: serial.Serial) -> str:
+    """
+    Manda STS continuamente hasta ver STS00...
+    Devuelve el último inner válido que confirmó OK.
+    """
+    print("\n[PRE] Polling STS hasta STS00...")
+    last_good = ""
+    while True:
+        parsed = send_cmd(ser, "STS")
+        if parsed.ok:
+            last_good = parsed.inner
+            if is_sts_ok(parsed.inner):
+                print(f"[PRE] OK: {parsed.inner!r}")
+                return parsed.inner
+            else:
+                print(f"[PRE] NOT OK: {parsed.inner!r}")
+        else:
+            print(f"[PRE] STS failed: {parsed.error}")
+        time.sleep(STS_PERIOD_S)
 
+
+def run_sequence(ser: serial.Serial, sequence: list[str]) -> None:
+    print("\n[SEQ] Iniciando rutina:", sequence)
+
+    for cmd in sequence:
+        success = False
+        last_error = ""
+
+        for attempt in range(1, RETRIES_PER_CMD + 1):
+            rt = READ_TIMEOUT_CAP_S if cmd == "CAP" else READ_TIMEOUT_S
+            parsed = send_cmd(ser, cmd, read_timeout_s=rt)
+
+            if parsed.ok:
+                print(f"[SEQ] {cmd} -> {parsed.inner!r} (cs=0x{parsed.cs_rx:02X})")
+
+                # Caso lógico de error (ej: CAP01)
+                if cmd == "CAP" and not parsed.inner.endswith("00"):
+                    print(f"[SEQ] WARN: {cmd} respondió error lógico ({parsed.inner})")
+                success = True
+                break
+            else:
+                last_error = parsed.error
+                print(
+                    f"[SEQ] {cmd} attempt {attempt}/{RETRIES_PER_CMD} FAIL: {parsed.error}"
+                )
+                time.sleep(0.1)
+
+        if not success:
+            print(
+                f"[SEQ] ERROR: {cmd} falló tras {RETRIES_PER_CMD} intentos "
+                f"(último error: {last_error})"
+            )
+            print("[SEQ] Continuando con el siguiente comando...\n")
+
+        time.sleep(INTER_CMD_DELAY_S)
+
+    print("[SEQ] Rutina terminada (con o sin errores).")
+
+
+def ask_repeat_or_quit() -> str:
+    while True:
+        ans = input("\n¿Repetir rutina? (r=repeat / q=quit): ").strip().lower()
+        if ans in ("r", "q"):
+            return ans
+        
+def drain_rx(ser: serial.Serial):
+    while ser.in_waiting:
+        ser.read(ser.in_waiting)
 
 def main():
-    commands = [
-        ("STS", "Get status (STS) -> payload responds STS + EE + B0B1B2"),
-        ("TIM", "Time request (TIM)"),
-        ("CAP", "Capture/save gyro log to Mission Flash (CAP)"),
-        ("JPG", "JPG command (stubbed in payload)"),
-        ("CMC", "CMC command (stubbed)"),
-        ("PDN", "PDN command (stubbed)"),
-        ("RST", "RST command (stubbed)"),
-        ("OWT", "OWT command (stubbed)"),
-        ("CAN", "CAN command (stubbed)"),
-        ("NUM", "NUM command (stubbed)"),
-        ("IMG", "IMG command (stubbed)"),
-        ("CMW", "CMW command (stubbed)"),
-        ("CMR", "CMR command (stubbed)"),
-        ("CUSTOM", "Send a custom 3-letter cmd (or longer, careful with length)"),
-        ("QUIT", "Exit"),
-    ]
+    # Ajusta el orden EXACTO que quieras después de que STS00 aparezca
+    routine = ["TIM", "CAP", "JPG", "CMC", "PDN", "RST", "OWT", "CAN", "NUM", "IMG", "CMW", "CMR"]
 
     with serial.Serial(
         PORT,
         BAUD,
         timeout=TIMEOUT,
-        parity=serial.PARITY_NONE,   # <<< CAMBIO CLAVE
+        parity=serial.PARITY_NONE,   # ST-LINK típico 8N1
         stopbits=serial.STOPBITS_ONE,
-        bytesize=serial.EIGHTBITS
+        bytesize=serial.EIGHTBITS,
     ) as ser:
-
-        print(f"Connected to {PORT} @ {BAUD} bps")
-        print("Tip: verify your wiring/logic levels + UART settings match (baud/parity).")
-        print()
+        time.sleep(0.2)
+        drain_rx(ser)
+        print(f"Connected to {PORT} @ {BAUD} (8N1)")
 
         while True:
-            print("\n=== OBC Console ===")
-            for i, (cmd, desc) in enumerate(commands, 1):
-                print(f"{i:2d}) {cmd:<6} - {desc}")
+            # 1) STS continuo hasta STS00
+            preflight_wait_sts_ok(ser)
 
-            choice = input("\nSelect option: ").strip()
-            if not choice.isdigit():
-                print("Enter a number.")
-                continue
+            # 2) Secuencia de comandos
+            run_sequence(ser, routine)
 
-            idx = int(choice) - 1
-            if idx < 0 or idx >= len(commands):
-                print("Out of range.")
-                continue
-
-            cmd = commands[idx][0]
-            if cmd == "QUIT":
+            # 3) Repetir o salir
+            ans = ask_repeat_or_quit()
+            if ans == "q":
                 break
-
-            if cmd == "CUSTOM":
-                inner = input("Enter inner command (ASCII): ").strip()
-            else:
-                inner = cmd
-
-            try:
-                send_and_read(ser, inner)
-            except Exception as e:
-                print("Error:", e)
 
     print("Disconnected.")
 

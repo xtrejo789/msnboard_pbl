@@ -63,7 +63,7 @@ volatile uint8_t flag_capture_active   = 0;  // B0: logging de giroscopio
 volatile uint8_t flag_flash_saving     = 0;  // B1: guardando en MSFM
 volatile uint8_t flag_data_transfer    = 0;  // B2: transferencia (no usada aquí)
 
-#define huart_cam huart3
+#define huart_cam huart2
 
 #define FLASH_CS_PORT     GPIOB
 #define FLASH_CS_PIN      GPIO_PIN_12   // Adjust
@@ -71,7 +71,7 @@ volatile uint8_t flag_data_transfer    = 0;  // B2: transferencia (no usada aqu�
 #define FLASH_SECTOR_SIZE   (64UL*1024UL)
 #define FLASH_PAGE_SIZE     (4UL*1024UL)
 #define FLASH_SLOT_SIZE     (4UL*1024*1024UL)  // mem_block_size del PIC
-#define GYRO_SLOT_INDEX     0
+#define GYRO_SLOT_INDEX     1
 #define GYRO_BASE_ADDR      (GYRO_SLOT_INDEX * FLASH_SLOT_SIZE)
 
 // Opcodes according to Main PIC's code
@@ -109,8 +109,7 @@ void log_current_gyro(uint32_t t_ms, int16_t gx, int16_t gy, int16_t gz);
 uint8_t cam_checksum(const char *s);
 void cam_build_response(const char *inner, uint8_t *out);
 void handle_cam_command(const char *inner_cmd);
-void CheckOBC_Task(void);
-
+void CheckOBC_Task(uint32_t timeout_ms_unused);
 /* Prototypes for FM*/
 bool FLASH_WriteEnable(void);
 bool FLASH_WaitBusy(uint32_t timeout_ms);
@@ -119,6 +118,8 @@ bool FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len);
 void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len);
 bool FLASH_WriteLogToMissionFlash(void);
 static void build_STS_inner(char *inner, size_t inner_size);
+static int hex_nibble(char c);
+static bool parse_hex2(const char *p, uint8_t *out);
 
 /* USER CODE END PFP */
 
@@ -134,6 +135,9 @@ typedef struct __attribute__((packed)) {
 #define MAX_SAMPLES 6000
 GyroSample gyro_log[MAX_SAMPLES];
 uint32_t   gyro_count = 0;
+
+volatile uint8_t pending_flash_write = 0;
+volatile uint8_t last_cap_result_ok = 1; // opcional
 
 // MSN (UART)
 #define CAM_MSG_LEN 64
@@ -189,31 +193,49 @@ int main(void)
   /* Infinite loop */
   while (1)
   {
+	  CheckOBC_Task(0);
       static uint32_t t0_ms = 0;
 
       uint32_t now_ms = HAL_GetTick();
       if (t0_ms == 0) {
-          t0_ms = now_ms;   // time reference for samples
+          t0_ms = now_ms;
       }
 
-      /* 1️ logging to RAM */
+      /* 1) Log a RAM (gyro) */
       if (gyro_ok && gyro_count < MAX_SAMPLES) {
-          flag_capture_active = 1;   // capturing data
-          if (L3G4200D_ReadGyro(&gyro_x, &gyro_y, &gyro_z)) {
-              int16_t gx_corr = gyro_x - bias_x;
-              int16_t gy_corr = gyro_y - bias_y;
-              int16_t gz_corr = gyro_z - bias_z;
+          flag_capture_active = 1;
 
-              log_current_gyro(now_ms - t0_ms, gx_corr, gy_corr, gz_corr);
+          if (L3G4200D_ReadGyro(&gyro_x, &gyro_y, &gyro_z)) {
+              log_current_gyro(
+                  now_ms - t0_ms,
+                  gyro_x - bias_x,
+                  gyro_y - bias_y,
+                  gyro_z - bias_z
+              );
           }
       } else {
-          flag_capture_active = 0;   // full buffer or sensor is not OK
+          flag_capture_active = 0;
       }
 
-      /* 2️ check for OBC commands */
-      CheckOBC_Task();
+      CheckOBC_Task(0);
 
-      //HAL_Delay(100);
+      /* 2) Escritura a flash (CAP) */
+      if (pending_flash_write) {
+          pending_flash_write = 0;
+
+          bool ok = FLASH_WriteLogToMissionFlash();
+          last_cap_result_ok = ok ? 1 : 0;
+
+          // Responde al OBC con resultado real
+          uint8_t tx_buf[CAM_MSG_LEN];
+          cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
+          HAL_UART_Transmit(&huart_cam, tx_buf, CAM_MSG_LEN, 100);
+
+          flag_flash_saving = 0;
+      }
+
+      /* 3) Atender comandos OBC (bloquea hasta timeout_ms) */
+      CheckOBC_Task(0);
   }
 
     /* USER CODE END WHILE */
@@ -476,6 +498,24 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+static bool parse_hex2(const char *p, uint8_t *out)
+{
+    int hi = hex_nibble(p[0]);
+    int lo = hex_nibble(p[1]);
+    if (hi < 0 || lo < 0) return false;
+    *out = (uint8_t)((hi << 4) | lo);
+    return true;
+}
+
 bool FLASH_Probe(void)
 {
     uint8_t cmd = FLASH_CMD_RDID;
@@ -503,7 +543,7 @@ bool FLASH_Probe(void)
 /* ======== Utilidades UART/I2C y manejo de giroscopio ======== */
 void UART_Print(char *msg)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
 }
 
 uint8_t I2C_ReadByte(uint8_t reg)
@@ -624,7 +664,7 @@ void handle_cam_command(const char *inner_cmd)
 {
     uint8_t tx_buf[CAM_MSG_LEN];
 
-    snprintf(msg, sizeof(msg), "CMD from PIC: %s\r\n", inner_cmd);
+    //snprintf(msg, sizeof(msg), "CMD from PIC: %s\r\n", inner_cmd);
     //UART_Print(msg);
 
     if (strncmp(inner_cmd, "STS", 3) == 0) {
@@ -639,9 +679,12 @@ void handle_cam_command(const char *inner_cmd)
 
     } else if (strncmp(inner_cmd, "CAP", 3) == 0) {
 
-        bool ok = FLASH_WriteLogToMissionFlash();
-        cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
+        // Agenda la escritura y marca "en progreso" para STS (B1)
+        pending_flash_write = 1;
+        flag_flash_saving = 1;
 
+        // NO respondemos aquí: responderemos CAP00/CAP01 cuando termine la escritura
+        return;
     } else if (strncmp(inner_cmd, "JPG", 3) == 0) {
 
         cam_build_response("JPG00", tx_buf);
@@ -682,32 +725,82 @@ void handle_cam_command(const char *inner_cmd)
 }
 
 
-void CheckOBC_Task(void)
+void CheckOBC_Task(uint32_t timeout_ms_unused)
 {
-    uint8_t rx_buf[CAM_MSG_LEN];
-    char    inner[CAM_MSG_LEN];
+    (void)timeout_ms_unused;
 
-    if (HAL_UART_Receive(&huart_cam, rx_buf, CAM_MSG_LEN, 200) != HAL_OK)
-        return;
+    static uint8_t rx_frame[CAM_MSG_LEN];
+    static uint8_t rx_pos = 0;
+    static uint8_t in_frame = 0;
 
-    if (rx_buf[0] != OBC_HEADER) return;
+    uint8_t b;
 
-    int footer = -1;
-    for (int i = 1; i < CAM_MSG_LEN; i++) {
-        if (rx_buf[i] == (OBC_HEADER + 1)) { // 0x0C
-            footer = i;
-            break;
+    // Lee TODOS los bytes disponibles en este "tick" sin bloquear
+    while (HAL_UART_Receive(&huart_cam, &b, 1, 0) == HAL_OK) {
+
+        if (!in_frame) {
+            // Espera a ver el header del OBC
+            if (b == OBC_HEADER) {
+                in_frame = 1;
+                rx_pos = 0;
+                rx_frame[rx_pos++] = b;
+            }
+            continue;
+        }
+
+        // Ya estamos capturando frame
+        rx_frame[rx_pos++] = b;
+
+        if (rx_pos >= CAM_MSG_LEN) {
+            // Tenemos 64 bytes: parsear igual que antes
+            // 1) validar header
+            if (rx_frame[0] == OBC_HEADER) {
+
+                // 2) buscar footer 0x0C
+                int footer = -1;
+                for (int i = 1; i < CAM_MSG_LEN; i++) {
+                    if (rx_frame[i] == (OBC_HEADER + 1)) { // 0x0C
+                        footer = i;
+                        break;
+                    }
+                }
+
+                if (footer >= 0 && footer >= (1 + 3 + 2)) {
+                    int inner_len = footer - 1 - 2; // bytes entre header y checksum
+                    if (inner_len > 0 && inner_len < CAM_MSG_LEN) {
+
+                        char inner[CAM_MSG_LEN];
+                        memcpy(inner, &rx_frame[1], inner_len);
+                        inner[inner_len] = '\0';
+
+                        char cs_ascii[3];
+                        cs_ascii[0] = (char)rx_frame[footer - 2];
+                        cs_ascii[1] = (char)rx_frame[footer - 1];
+                        cs_ascii[2] = '\0';
+
+                        uint8_t cs_rx = 0;
+                        if (parse_hex2(cs_ascii, &cs_rx)) {
+                            uint8_t cs_calc = cam_checksum(inner);
+
+                            if (cs_rx == cs_calc) {
+                                // ✅ Frame OK -> ejecuta comando
+                                handle_cam_command(inner);
+                            } else {
+                                // checksum mismatch (opcional: responder error)
+                                // uint8_t tx_buf[CAM_MSG_LEN];
+                                // cam_build_response("RST01", tx_buf);
+                                // HAL_UART_Transmit(&huart_cam, tx_buf, CAM_MSG_LEN, 100);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reset para buscar el siguiente frame (resincroniza)
+            in_frame = 0;
+            rx_pos = 0;
         }
     }
-    if (footer < 0) return;
-
-    int inner_len = footer - 1 - 2; // -2 because of checksum
-    if (inner_len <= 0 || inner_len >= CAM_MSG_LEN) return;
-
-    memcpy(inner, &rx_buf[1], inner_len);
-    inner[inner_len] = '\0';
-
-    handle_cam_command(inner);
 }
 
 bool FLASH_WriteEnable(void)
@@ -799,15 +892,17 @@ void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len)
 bool FLASH_WriteLogToMissionFlash(void)
 {
     if (gyro_count == 0) return false;
+    flag_flash_saving = 1;
+
+
 
     // 1) Verifica que la flash exista (RDID válido)
-    if (!FLASH_Probe()) return false;
+    if (!FLASH_Probe()) { flag_flash_saving = 0; return false; }
 
     uint32_t file_size = gyro_count * sizeof(GyroSample);
-    if (file_size > (FLASH_SLOT_SIZE - 0x10)) return false;
+    if (file_size > (FLASH_SLOT_SIZE - 0x10)) { flag_flash_saving = 0; return false; }
 
     uint32_t addr = GYRO_BASE_ADDR;
-    flag_flash_saving = 1;
 
     // 2) Erase de todo el slot
     for (uint32_t a = addr; a < (addr + FLASH_SLOT_SIZE); a += FLASH_SECTOR_SIZE) {
@@ -815,6 +910,7 @@ bool FLASH_WriteLogToMissionFlash(void)
             flag_flash_saving = 0;
             return false;
         }
+        CheckOBC_Task(5);
     }
 
     // 3) Header 16B
@@ -830,6 +926,7 @@ bool FLASH_WriteLogToMissionFlash(void)
     }
     addr += sizeof(header);
 
+
     // 4) Datos
     const uint8_t *p = (const uint8_t*)gyro_log;
     uint32_t remaining = file_size;
@@ -842,6 +939,8 @@ bool FLASH_WriteLogToMissionFlash(void)
             flag_flash_saving = 0;
             return false;
         }
+
+        CheckOBC_Task(5);
 
         addr      += chunk;
         p         += chunk;
