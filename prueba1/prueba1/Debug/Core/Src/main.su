@@ -20,7 +20,7 @@
 ../Core/Src/main.c:644:9:cam_checksum	24	static
 ../Core/Src/main.c:651:6:cam_build_response	24	static
 ../Core/Src/main.c:663:6:handle_cam_command	96	static
-../Core/Src/main.c:728:6:CheckOBC_Task	104	static
+../Core/Src/main.c:728:6:CheckOBC_Task	168	static
 ../Core/Src/main.c:806:6:FLASH_WriteEnable	16	static
 ../Core/Src/main.c:815:6:FLASH_WaitBusy	24	static
 ../Core/Src/main.c:838:6:FLASH_SectorErase	24	static

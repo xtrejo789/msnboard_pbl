@@ -786,10 +786,10 @@ void CheckOBC_Task(uint32_t timeout_ms_unused)
                                 // ✅ Frame OK -> ejecuta comando
                                 handle_cam_command(inner);
                             } else {
-                                // checksum mismatch (opcional: responder error)
-                                // uint8_t tx_buf[CAM_MSG_LEN];
-                                // cam_build_response("RST01", tx_buf);
-                                // HAL_UART_Transmit(&huart_cam, tx_buf, CAM_MSG_LEN, 100);
+                                // checksum mismatch (responder error)
+                                uint8_t tx_buf[CAM_MSG_LEN];
+                                cam_build_response("RST01", tx_buf);
+                                HAL_UART_Transmit(&huart_cam, tx_buf, CAM_MSG_LEN, 100);
                             }
                         }
                     }
