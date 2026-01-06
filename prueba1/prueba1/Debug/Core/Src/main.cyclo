@@ -27,5 +27,5 @@
 ../Core/Src/main.c:857:6:FLASH_PageProgram	4
 ../Core/Src/main.c:877:6:FLASH_Read	1
 ../Core/Src/main.c:892:6:FLASH_WriteLogToMissionFlash	9
-../Core/Src/main.c:955:13:build_STS_inner	5
-../Core/Src/main.c:980:6:Error_Handler	1
+../Core/Src/main.c:954:13:build_STS_inner	5
+../Core/Src/main.c:979:6:Error_Handler	1

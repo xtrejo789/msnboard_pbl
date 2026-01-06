@@ -891,10 +891,9 @@ void FLASH_Read(uint32_t addr, uint8_t *data, uint32_t len)
 
 bool FLASH_WriteLogToMissionFlash(void)
 {
-    if (gyro_count == 0) return false;
     flag_flash_saving = 1;
 
-
+    if (gyro_count == 0) { flag_flash_saving = 0; return false; }
 
     // 1) Verifica que la flash exista (RDID válido)
     if (!FLASH_Probe()) { flag_flash_saving = 0; return false; }
