@@ -54,6 +54,7 @@ UART_HandleTypeDef huart3;
 int16_t gyro_x, gyro_y, gyro_z;
 char msg[64];
 bool gyro_ok = false;
+volatile uint8_t tx_busy = 0;
 
 /* Conversion and bias */
 static int16_t bias_x=0, bias_y=0, bias_z=0;
@@ -98,7 +99,6 @@ static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_USART3_UART_Init(void);
-bool FLASH_Probe(void);
 /* USER CODE BEGIN PFP */
 /* Prototipos de utilidades y sensor */
 static void PC_Print(const char *s);
@@ -110,9 +110,10 @@ bool L3G4200D_ReadGyro(int16_t *x, int16_t *y, int16_t *z);
 static void Gyro_Calibrate(uint16_t n);
 void log_current_gyro(uint32_t t_ms, int16_t gx, int16_t gy, int16_t gz);
 uint8_t cam_checksum(const char *s);
-void cam_build_response(const char *inner, uint8_t *out);
+size_t cam_build_response(const char *inner, uint8_t *out);
 void handle_cam_command(const char *inner_cmd);
 void CheckOBC_Task(uint32_t timeout_ms);
+static void PC_PrintHexN(const char *tag, const uint8_t *buf, size_t nbytes);
 
 /* Prototypes for FM*/
 bool FLASH_WriteEnable(void);
@@ -189,7 +190,6 @@ int main(void)
   //UART_Print("Keep still for bias calib...\r\n");
   Gyro_Calibrate(200);
   //UART_Print("Bias calibrated.\r\n");
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -197,15 +197,11 @@ int main(void)
   /* Infinite loop */
   while (1)
   {
-	  CheckOBC_Task(0);
       static uint32_t t0_ms = 0;
-
       uint32_t now_ms = HAL_GetTick();
-      if (t0_ms == 0) {
-          t0_ms = now_ms;
-      }
+      if (t0_ms == 0) t0_ms = now_ms;
 
-      /* 1) Log a RAM (gyro) */
+      // 1) Log a RAM (gyro)
       if (gyro_ok && gyro_count < MAX_SAMPLES) {
           flag_capture_active = 1;
 
@@ -221,27 +217,32 @@ int main(void)
           flag_capture_active = 0;
       }
 
-      CheckOBC_Task(0);
-
-      /* 2) Escritura a flash (CAP) */
+      // 2) Si hubo CAP, escribe flash y responde UNA vez
       if (pending_flash_write) {
           pending_flash_write = 0;
 
           bool ok = FLASH_WriteLogToMissionFlash();
           last_cap_result_ok = ok ? 1 : 0;
 
-          // Responde al OBC con resultado real
           uint8_t tx_buf[CAM_MSG_LEN];
-          cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
-          HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 100);
+          size_t tx_len = cam_build_response(ok ? "CAP00" : "CAP01", tx_buf);
+
+          HAL_Delay(10);
+          tx_busy = 1;
+          HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 500);
+          HAL_Delay(10);
+          tx_busy = 0;
+          PC_PrintHexN("[TX->OBC frame] ", tx_buf, tx_len);
+          PC_Print("\r\n");
+          PC_PrintHexN("[TX->OBC 64B ] ", tx_buf, CAM_MSG_LEN);
+          PC_Print("\r\n");
 
           flag_flash_saving = 0;
       }
 
-      /* 3) Atender comandos OBC (bloquea hasta timeout_ms) */
+      // 3) Procesa comandos del OBC UNA vez por iteración
       CheckOBC_Task(0);
   }
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -411,7 +412,7 @@ static void MX_USART3_UART_Init(void)
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 9600;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.WordLength = UART_WORDLENGTH_9B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_EVEN;
   huart3.Init.Mode = UART_MODE_TX_RX;
@@ -483,7 +484,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB12 */
+  /*Configure GPIO pin : FLASH_CS_PIN_Pin */
   GPIO_InitStruct.Pin = FLASH_CS_PIN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -547,7 +548,7 @@ bool FLASH_Probe(void)
 /* ======== Utilidades UART/I2C y manejo de giroscopio ======== */
 static void PC_Print(const char *s)
 {
-    HAL_UART_Transmit(&UART_PC, (uint8_t*)s, strlen(s), 50);
+    HAL_UART_Transmit(&UART_PC, (uint8_t*)s, strlen(s), 500);
 }
 
 static void PC_PrintHex64(const char *tag, const uint8_t *buf)
@@ -563,6 +564,20 @@ static void PC_PrintHex64(const char *tag, const uint8_t *buf)
     n += snprintf(line+n, sizeof(line)-n, "\r\n");
     PC_Print(line);
 }
+
+static void PC_PrintHexN(const char *tag, const uint8_t *buf, size_t nbytes)
+{
+    char line[512];   // <-- antes 256
+    int n = 0;
+    n += snprintf(line+n, sizeof(line)-n, "%s", tag);
+    for (size_t i = 0; i < nbytes; i++) {
+        n += snprintf(line+n, sizeof(line)-n, "%02X ", buf[i]);
+        if (n >= (int)sizeof(line)-4) break;
+    }
+    n += snprintf(line+n, sizeof(line)-n, "\r\n");
+    PC_Print(line);
+}
+
 
 uint8_t I2C_ReadByte(uint8_t reg)
 {
@@ -666,112 +681,195 @@ uint8_t cam_checksum(const char *s)
     return c;
 }
 
-void cam_build_response(const char *inner, uint8_t *out)
+static uint8_t cam_checksum_xor64(const uint8_t *frame64)
 {
-    memset(out, 0, CAM_MSG_LEN);
-    size_t len = strlen(inner);
-    uint8_t cs = cam_checksum(inner);
+    // XOR bytes 1..61 (excluye header [0], checksum [62] y footer [63])
+    uint8_t c = 0;
+    for (int i = 1; i <= 61; i++) c ^= frame64[i];
+    return c;
+}
+
+static char hex_digit(uint8_t v)
+{
+    v &= 0x0F;
+    return (v < 10) ? ('0' + v) : ('A' + (v - 10));
+}
+
+static uint8_t cam_checksum_xor_range(const uint8_t *buf, int start, int end)
+{
+    uint8_t c = 0;
+    for (int i = start; i <= end; i++) c ^= buf[i];
+    return c;
+}
+
+size_t cam_build_response(const char *inner, uint8_t *out)
+{
+    memset(out, 0, CAM_MSG_LEN);     // 64 bytes
 
     out[0] = CAM_HEADER;             // 0xCA
-    memcpy(&out[1], inner, len);     // "STS00000", etc.
-    sprintf((char*)&out[1+len], "%02X", cs); // checksum ASCII HEX
-    out[1 + len + 2] = CAM_HEADER + 1;       // 0xCB
+
+    // inner goes in [1..60] max (because [61..62] are checksum ASCII)
+    size_t len = strlen(inner);
+    if (len > 60) len = 60;
+    memcpy(&out[1], inner, len);
+
+    // checksum XOR of the C-string (stops at '\0')
+    uint8_t cs = 0;
+    for (int i = 1; i <= 60; i++) cs ^= out[i];
+
+    // place checksum as 2 ASCII hex digits at [61] and [62]
+    out[61] = (uint8_t)hex_digit(cs >> 4);
+    out[62] = (uint8_t)hex_digit(cs);
+
+    // footer fixed at last byte
+    out[63] = CAM_HEADER + 1;        // 0xCB
+
+    uint8_t cs_str = cam_checksum(inner);
+    uint8_t cs_fix = cam_checksum_xor_range(out, 1, 60);
+
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg),
+             "DBG: cs_str=%02X cs_fix(1..60)=%02X ascii=%c%c\r\n",
+             cs_str, cs_fix, out[61], out[62]);
+    PC_Print(dbg);
+
+    return CAM_MSG_LEN;
 }
 
 void handle_cam_command(const char *inner_cmd)
 {
     uint8_t tx_buf[CAM_MSG_LEN];
+    size_t  tx_len = 0;
 
     snprintf(msg, sizeof(msg), "CMD from OBC: %s\r\n", inner_cmd);
     PC_Print(msg);
 
     if (strncmp(inner_cmd, "STS", 3) == 0) {
-
         char inner[16];
         build_STS_inner(inner, sizeof(inner));
-        cam_build_response(inner, tx_buf);
+        tx_len = cam_build_response(inner, tx_buf);
 
     } else if (strncmp(inner_cmd, "TIM", 3) == 0) {
-
-        cam_build_response("TIM00", tx_buf);
+        tx_len = cam_build_response("TIM00", tx_buf);
 
     } else if (strncmp(inner_cmd, "CAP", 3) == 0) {
-
-        // Agenda la escritura y marca "en progreso" para STS (B1)
         pending_flash_write = 1;
         flag_flash_saving = 1;
-
-        // NO respondemos aquí: responderemos CAP00/CAP01 cuando termine la escritura
         return;
-    } else if (strncmp(inner_cmd, "JPG", 3) == 0) {
 
-        cam_build_response("JPG00", tx_buf);
+    } else if (strncmp(inner_cmd, "JPG", 3) == 0) {
+        tx_len = cam_build_response("JPG00", tx_buf);
 
     } else if (strncmp(inner_cmd, "CMC", 3) == 0) {
-
-        cam_build_response("CMC00", tx_buf);
+        tx_len = cam_build_response("CMC00", tx_buf);
 
     } else if (strncmp(inner_cmd, "PDN", 3) == 0) {
-        cam_build_response("PDN00", tx_buf);
+        tx_len = cam_build_response("PDN00", tx_buf);
 
     } else if (strncmp(inner_cmd, "RST", 3) == 0) {
-        cam_build_response("RST00", tx_buf);
+        tx_len = cam_build_response("RST00", tx_buf);
 
     } else if (strncmp(inner_cmd, "OWT", 3) == 0) {
-        cam_build_response("OWT00", tx_buf);
+        tx_len = cam_build_response("OWT00", tx_buf);
 
     } else if (strncmp(inner_cmd, "CAN", 3) == 0) {
-        cam_build_response("CAN00", tx_buf);
+        tx_len = cam_build_response("CAN00", tx_buf);
 
     } else if (strncmp(inner_cmd, "NUM", 3) == 0) {
-        cam_build_response("NUM00000", tx_buf);
+        tx_len = cam_build_response("NUM00000", tx_buf);
 
     } else if (strncmp(inner_cmd, "IMG", 3) == 0) {
-        cam_build_response("IMG000000000000", tx_buf);
+        tx_len = cam_build_response("IMG000000000000", tx_buf);
 
     } else if (strncmp(inner_cmd, "CMW", 3) == 0) {
-        cam_build_response("CMW00", tx_buf);
+        tx_len = cam_build_response("CMW00", tx_buf);
 
     } else if (strncmp(inner_cmd, "CMR", 3) == 0) {
-        cam_build_response("CMR0000", tx_buf);
-    } else {
+        tx_len = cam_build_response("CMR0000", tx_buf);
 
-        cam_build_response("RST01", tx_buf);
+    } else {
+        tx_len = cam_build_response("RST01", tx_buf);
     }
 
-    // Send answer to OBC
-    HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 100);
+    HAL_Delay(20);
+    if (tx_len > 0 && tx_buf[tx_len - 1] != 0xCB) {
+        PC_Print("ERR: tx footer not CB!\r\n");
+    }
+    char dbg2[64];
+    snprintf(dbg2, sizeof(dbg2),
+             "DBG2: tx_len=%u last=%02X\r\n",
+             (unsigned)tx_len, tx_buf[tx_len-1]);
+    PC_Print(dbg2);
 
-    // Debug for personal laptop
-    PC_PrintHex64("[TX->OBC] ", tx_buf);
+    tx_busy = 1;
+    HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 500);
+    HAL_Delay(10);
+    tx_busy = 0;
+
+    // 1) Frame real (útil para ver header, inner, checksum y CB rápido)
+    PC_PrintHexN("[TX->OBC frame] ", tx_buf, tx_len);
+    PC_Print("\r\n");
+
+    // 2) Paquete completo (útil para confirmar padding y que CB sí está dentro de 64)
+    PC_PrintHexN("[TX->OBC 64B ] ", tx_buf, CAM_MSG_LEN);
+    PC_Print("\r\n");
 }
 
 // Makes sure Payload sends STS even while it is writing data to MSFM
 void CheckOBC_Task(uint32_t timeout_ms_unused)
 {
+
     (void)timeout_ms_unused;
 
     static uint8_t rx_frame[CAM_MSG_LEN];
     static uint8_t rx_pos = 0;
     static uint8_t in_frame = 0;
+    static uint32_t frame_t0 = 0;
 
-    uint8_t b;
+    if (in_frame && (HAL_GetTick() - frame_t0) > 150) {
+        in_frame = 0;
+        rx_pos = 0;
+    }
+
+    if (tx_busy) {
+        uint8_t dump;
+        while (HAL_UART_Receive(&UART_OBC, &dump, 1, 0) == HAL_OK) {;}
+        __HAL_UART_CLEAR_OREFLAG(&UART_OBC);
+        __HAL_UART_CLEAR_FEFLAG(&UART_OBC);
+        __HAL_UART_CLEAR_NEFLAG(&UART_OBC);
+        return;
+    }
 
     // Lee TODOS los bytes disponibles en este "tick" sin bloquear
+    uint8_t b;
     while (HAL_UART_Receive(&UART_OBC, &b, 1, 0) == HAL_OK) {
 
         if (!in_frame) {
-            // Espera a ver el header del OBC
             if (b == OBC_HEADER) {
                 in_frame = 1;
                 rx_pos = 0;
                 rx_frame[rx_pos++] = b;
+                frame_t0 = HAL_GetTick();
             }
             continue;
         }
 
-        // Ya estamos capturando frame
-        rx_frame[rx_pos++] = b;
+        // If we see a new header while in frame -> re-sync
+        if (b == OBC_HEADER) {
+            rx_pos = 0;
+            rx_frame[rx_pos++] = b;
+            frame_t0 = HAL_GetTick();
+            continue;
+        }
+
+        // safe write
+        if (rx_pos < CAM_MSG_LEN) {
+            rx_frame[rx_pos++] = b;
+        } else {
+            in_frame = 0;
+            rx_pos = 0;
+            continue;
+        }
 
         if (rx_pos >= CAM_MSG_LEN) {
             // Tenemos 64 bytes: parsear igual que antes
@@ -807,11 +905,25 @@ void CheckOBC_Task(uint32_t timeout_ms_unused)
                             if (cs_rx == cs_calc) {
                                 // ✅ Frame OK -> ejecuta comando
                                 handle_cam_command(inner);
+                                in_frame = 0;
+                                rx_pos = 0;
+                                break;
                             } else {
                                 // checksum mismatch (responder error)
                                 uint8_t tx_buf[CAM_MSG_LEN];
-                                cam_build_response("RST01", tx_buf);
-                                HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 100);
+                                size_t tx_len = cam_build_response("RST01", tx_buf);
+                                tx_busy = 1;
+                                HAL_UART_Transmit(&UART_OBC, tx_buf, CAM_MSG_LEN, 500);
+                                tx_busy = 0;
+                                HAL_Delay(10);
+                                PC_PrintHexN("[TX->OBC frame] ", tx_buf, tx_len);
+                                PC_Print("\r\n");
+                                PC_PrintHexN("[TX->OBC 64B ] ", tx_buf, CAM_MSG_LEN);
+                                PC_Print("\r\n");
+                                in_frame = 0;
+                                rx_pos = 0;
+                                break;
+
                             }
                         }
                     }
