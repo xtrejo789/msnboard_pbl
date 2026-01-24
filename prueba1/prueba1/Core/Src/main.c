@@ -73,9 +73,8 @@ volatile uint8_t flag_data_transfer = 0;  // B2: transferencia (no usada aquí)
 #define FLASH_SECTOR_SIZE   (64UL*1024UL)
 #define FLASH_PAGE_SIZE     (4UL*1024UL)
 #define FLASH_SLOT_SIZE     (4UL*1024*1024UL)  // mem_block_size del PIC
-#define GYRO_SLOT_INDEX     1
-#define GYRO_BASE_ADDR      (GYRO_SLOT_INDEX * FLASH_SLOT_SIZE)
-
+#define GYRO_SLOT_INDEX     0
+#define GYRO_BASE_ADDR (704UL * 64UL * 1024UL)  // = 0x02C00000
 // Opcodes according to Main PIC's code
 #define FLASH_CMD_RDID        0x9F
 #define FLASH_CMD_RDSR        0x05
@@ -202,24 +201,92 @@ int main(void)
   MX_SPI2_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-	//UART_Print("System Initialized\r\n");
-  FLASH_CS_HIGH();
-  FLASH_Enter4ByteAddr();
-  PC_Print("[FLASH] Unlocking Status Register...\r\n");
-  FLASH_PrintSR("[FLASH] SR before unlock:");
-  FLASH_WriteStatus(0x00);   // BP=000, WEL auto-clear
-  FLASH_PrintSR("[FLASH] SR after unlock:");
-  HAL_UART_Receive_IT(&UART_OBC, &obc_rx_byte, 1);
-  uint8_t sr = FLASH_ReadSR();
-  char dbg[64];
-  snprintf(dbg,sizeof(dbg),"SR raw = 0x%02X\r\n",sr);
+  /*
+  PC_Print("=== GPIO STATE BEFORE SPI INIT ===\r\n");
+
+  char dbg[128];
+
+  snprintf(dbg,sizeof(dbg),
+      "CS (PA4)  = %d\r\n", HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4));
   PC_Print(dbg);
+
+  snprintf(dbg,sizeof(dbg),
+      "SCK (PC7) = %d\r\n", HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_7));
+  PC_Print(dbg);
+
+  snprintf(dbg,sizeof(dbg),
+      "MISO(PB14)= %d\r\n", HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14));
+  PC_Print(dbg);
+
+  snprintf(dbg,sizeof(dbg),
+      "MOSI(PB15)= %d\r\n", HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15));
+  PC_Print(dbg);
+  */
+  FLASH_CS_HIGH();
+  PC_Print("\r\n[FLASH] Testing CS pin...\r\n");
+
+  // TEST: Verificar que el CS funciona
+  char dbg[64];
+  uint8_t cs_before = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
+  snprintf(dbg, sizeof(dbg), "[TEST] CS antes: %d (debe ser 1)\r\n", cs_before);
+  PC_Print(dbg);
+
+  FLASH_CS_LOW();
+  HAL_Delay(100);
+  uint8_t cs_during = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
+  snprintf(dbg, sizeof(dbg), "[TEST] CS durante: %d (debe ser 0)\r\n", cs_during);
+  PC_Print(dbg);
+
+  FLASH_CS_HIGH();
+  HAL_Delay(100);
+  uint8_t cs_after = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
+  snprintf(dbg, sizeof(dbg), "[TEST] CS después: %d (debe ser 1)\r\n", cs_after);
+  PC_Print(dbg);
+
+  PC_Print("\r\n[FLASH] Probing RDID...\r\n");
+  FLASH_Probe();
+
+  FLASH_Enter4ByteAddr();
+  PC_Print("[FLASH] Attempting to clear write protection...\r\n");
+  //FLASH_GlobalUnprotect();
+
+  //char dbg[64];
+
+  // DIAGNOSTIC: Skip GlobalUnprotect (0x98 command appears to be wrong/unsupported)
+  // Main PIC code works fine with just WREN before writes - no unprotect needed.
+  // Testing hypothesis: 0x98 may not be correct for this MT25QL variant
+  uint8_t sr_check = FLASH_ReadSR();
+  snprintf(dbg, sizeof(dbg), "[FLASH] Current SR: 0x%02X (WIP=%d WEL=%d BP2=%d BP1=%d BP0=%d)\r\n",
+      sr_check,
+      (sr_check & 0x01) ? 1 : 0,
+      (sr_check & 0x02) ? 1 : 0,
+      (sr_check & 0x20) ? 1 : 0,
+      (sr_check & 0x10) ? 1 : 0,
+      (sr_check & 0x08) ? 1 : 0);
+  PC_Print(dbg);
+  //FLASH_PrintSR("[FLASH] SR before unlock:");
+  /*
+  uint8_t test_sr[5];
+  for (int i = 0; i < 5; i++) {
+      test_sr[i] = FLASH_ReadSR();
+      snprintf(dbg, sizeof(dbg), "[FLASH] Test SR #%d = 0x%02X\r\n", i, test_sr[i]);
+      PC_Print(dbg);
+      HAL_Delay(100);
+  }
+  */
+  //snprintf(dbg, sizeof(dbg), "[FLASH] WRSR returned: %s\r\n", unlock_ok ? "OK" : "FAILED");
+  //PC_Print(dbg);
+  //FLASH_PrintSR("[FLASH] SR after unlock:");
+  HAL_UART_Receive_IT(&UART_OBC, &obc_rx_byte, 1);
+  //char dbg[64];
+  //snprintf(dbg,sizeof(dbg),"SR raw = 0x%02X\r\n",sr);
+  //PC_Print(dbg);
 	HAL_Delay(5000);
 	L3G4200D_Init();
 	//UART_Print("Gyro Initialized\r\n");
 	//UART_Print("Keep still for bias calib...\r\n");
 	Gyro_Calibrate(200);
-	//UART_Print("Bias calibrated.\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -392,10 +459,10 @@ static void MX_SPI2_Init(void)
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
   hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -538,6 +605,49 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void FLASH_GlobalUnprotect(void)
+{
+    // Step 1: Write 0x00 to clear SRWD (status register write disable) and BP bits
+    // This also clears WEL, WIP in the process
+
+    if (!FLASH_WriteEnable()) {
+        PC_Print("[FLASH] WREN failed\r\n");
+        return;
+    }
+
+    uint8_t cmd[2] = { 0x01, 0x00 }; // WRSR with 0x00
+    FLASH_CS_LOW();
+    HAL_SPI_Transmit(&hspi2, cmd, 2, 200);
+    FLASH_CS_HIGH();
+
+    HAL_Delay(100); // Wait for WRSR to complete
+
+    uint8_t sr_after = FLASH_ReadSR();
+    char dbg[100];
+    snprintf(dbg, sizeof(dbg),
+        "[FLASH] After WRSR(0x00): SR=0x%02X (SRWD=%d BP3=%d BP2=%d BP1=%d BP0=%d)\r\n",
+        sr_after,
+        (sr_after & 0x40) ? 1 : 0,  // SRWD bit 6
+        (sr_after & 0x20) ? 1 : 0,  // BP3 bit 5
+        (sr_after & 0x10) ? 1 : 0,  // BP2 bit 4
+        (sr_after & 0x08) ? 1 : 0,  // BP1 bit 3
+        (sr_after & 0x04) ? 1 : 0); // BP0 bit 2
+    PC_Print(dbg);
+}
+static void SPI_GPIO_Snapshot(const char *tag)
+{
+    char dbg[128];
+
+    snprintf(dbg, sizeof(dbg),
+        "%s | SCK=%d MOSI=%d MISO=%d CS=%d\r\n",
+        tag,
+        HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_7),   // SCK SPI2
+        HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_15),  // MOSI SPI2
+        HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14),  // MISO SPI2
+        HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4));  // CS
+    PC_Print(dbg);
+}
+
 static void FLASH_PrintSR(const char *tag)
 {
     uint8_t sr = FLASH_ReadSR();
@@ -678,28 +788,33 @@ static bool parse_hex2(const char *p, uint8_t *out) {
 	return true;
 }
 
-void FLASH_Probe(void) {
-	uint8_t tx[4] = { FLASH_CMD_RDID, 0x00, 0x00, 0x00 };
-	uint8_t rx[4] = { 0 };
+void FLASH_Probe(void)
+{
+    uint8_t tx[4] = { FLASH_CMD_RDID, 0x00, 0x00, 0x00 };
+    uint8_t rx[4] = { 0 };
 
-	FLASH_CS_LOW();
-	HAL_StatusTypeDef st = HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx),
-			200);
-	FLASH_CS_HIGH();
+    //SPI_GPIO_Snapshot("RDID before CS");
 
-	if (st != HAL_OK) {
-		PC_Print("[FLASH][ERR] SPI TxRx failed\r\n");
-	}
+    FLASH_CS_LOW();
+    //SPI_GPIO_Snapshot("RDID after CS LOW");
 
-	// rx[0] es basura (respuesta al 0x9F), rx[1..3] deberían ser ID
-	char id_dbg[64];
-	snprintf(id_dbg, sizeof(id_dbg), "[FLASH] RDID = %02X %02X %02X\r\n", rx[1],
-			rx[2], rx[3]);
-	PC_Print(id_dbg);
+    HAL_StatusTypeDef st =
+        HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx), 200);
 
-	if ((rx[1] == 0xFF && rx[2] == 0xFF && rx[3] == 0xFF)
-			|| (rx[1] == 0x00 && rx[2] == 0x00 && rx[3] == 0x00)) {
-	}
+    //SPI_GPIO_Snapshot("RDID after TXRX");
+
+    FLASH_CS_HIGH();
+    //SPI_GPIO_Snapshot("RDID after CS HIGH");
+
+    if (st != HAL_OK) {
+        PC_Print("[FLASH][ERR] SPI TxRx failed\r\n");
+    }
+
+    char id_dbg[64];
+    snprintf(id_dbg, sizeof(id_dbg),
+             "[FLASH] RDID = %02X %02X %02X\r\n",
+             rx[1], rx[2], rx[3]);
+    PC_Print(id_dbg);
 }
 /* ======== Utilidades UART/I2C y manejo de giroscopio ======== */
 static void PC_Print(const char *s) {
@@ -916,8 +1031,9 @@ void handle_cam_command(const char *inner_cmd) {
 
 	} else if (strncmp(inner_cmd, "CAP", 3) == 0) {
 
-	    flag_flash_saving = 1;
-	    pending_flash_write = 1;
+	    // Responde CAP00 pero difiere la escritura a MSFM
+	    // Espera al comando PDN para evitar contención durante camera mission
+	    // NO establecer flag_flash_saving ni pending_flash_write aquí
 
 	    tx_len = cam_build_response("CAP00", tx_buf);
 	    tx_busy = 1;
@@ -938,7 +1054,13 @@ void handle_cam_command(const char *inner_cmd) {
 		tx_len = cam_build_response("CMC00", tx_buf);
 
 	} else if (strncmp(inner_cmd, "PDN", 3) == 0) {
-		tx_len = cam_build_response("PDN00", tx_buf);
+
+	    // Ahora que termina la camera mission, iniciar escritura a MSFM
+	    // Esto evita contención con la secuencia de cámara
+	    flag_flash_saving = 1;
+	    pending_flash_write = 1;
+
+	    tx_len = cam_build_response("PDN00", tx_buf);
 
 	} else if (strncmp(inner_cmd, "RST", 3) == 0) {
 		tx_len = cam_build_response("RST00", tx_buf);
@@ -1110,6 +1232,7 @@ void CheckOBC_Task(uint32_t timeout_ms_unused)
 
 bool FLASH_WriteEnable(void)
 {
+	char dbg[64];
     uint8_t cmd = FLASH_CMD_WREN; // 0x06
 
     FLASH_CS_LOW();
@@ -1121,10 +1244,9 @@ bool FLASH_WriteEnable(void)
 
     // confirma WEL
     uint8_t sr = FLASH_ReadSR();
-    if ((sr & 0x02) == 0) {
-        PC_Print("[FLASH][ERR] WREN sent but WEL=0\r\n");
-        return false;
-    }
+    snprintf(dbg, sizeof(dbg), "[DEBUG] SR before write: 0x%02X WEL=%d\r\n",
+        sr, (sr & 0x02) ? 1 : 0);
+    PC_Print(dbg);
     return true;
 }
 
@@ -1132,26 +1254,36 @@ bool FLASH_WaitBusy(uint32_t timeout_ms) {
     uint8_t cmd = FLASH_CMD_RDSR; // 0x05
     uint8_t status = 0x01;
     uint32_t t0 = HAL_GetTick();
+    uint32_t attempt = 0;
 
     while (1) {
         FLASH_CS_LOW();
         if (HAL_SPI_Transmit(&hspi2, &cmd, 1, 100) != HAL_OK) {
             FLASH_CS_HIGH();
+            PC_Print("[FLASH][WAITBUSY] Transmit failed\r\n");
             return false;
         }
         if (HAL_SPI_Receive(&hspi2, &status, 1, 100) != HAL_OK) {
             FLASH_CS_HIGH();
+            PC_Print("[FLASH][WAITBUSY] Receive failed\r\n");
             return false;
         }
         FLASH_CS_HIGH();
 
         if ((status & 0x01) == 0) {
-            return true; // ya no busy
+            PC_Print("[FLASH][WAITBUSY] Done!\r\n");
+            return true;
         }
 
         if ((HAL_GetTick() - t0) > timeout_ms) {
-            return false; // timeout
+            char dbg[80];
+            //snprintf(dbg, sizeof(dbg), "[FLASH][WAITBUSY] TIMEOUT at attempt %lu, last SR=0x%02X\r\n",
+                     //attempt, status);
+            //PC_Print(dbg);
+            return false;
         }
+        attempt++;
+        HAL_Delay(10);
     }
 }
 
@@ -1165,60 +1297,86 @@ bool FLASH_SectorErase(uint32_t addr)
         (addr >>  0) & 0xFF
     };
 
-    FLASH_PrintSR("[FLASH] Before WREN:");
+    //FLASH_PrintSR("[FLASH] Before WREN:");
 
     if (!FLASH_WriteEnable()) {
-        FLASH_PrintSR("[FLASH] After WREN fail:");
+        //FLASH_PrintSR("[FLASH] After WREN fail:");
         return false;
     }
 
-    FLASH_PrintSR("[FLASH] After WREN:");
+    //FLASH_PrintSR("[FLASH] After WREN:");
 
     FLASH_CS_LOW();
+    HAL_Delay(1);  // Small delay before command
     if (HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK) {
         FLASH_CS_HIGH();
         PC_Print("[FLASH][ERR] Erase TX failed\r\n");
         return false;
     }
+    HAL_Delay(1);  // Small delay after command
     FLASH_CS_HIGH();
 
-    // Checa si arrancó busy
-    FLASH_PrintSR("[FLASH] After ERASE cmd:");
+    // CRITICAL: Wait 750ms like Main PIC does
+    HAL_Delay(750);  // <-- 750ms, not the polling loop
+    // CRITICAL: Wait until WIP=0 (erase truly complete)
+    if (!FLASH_WaitBusy(5000)) {
+        PC_Print("[FLASH][ERR] Erase WaitBusy timeout\r\n");
+        return false;
+    }
+    // Verificación post-erase: lee 4 bytes (deberían ser 0xFFFFFFFF)
+    uint8_t verify[4] = {0};
+    FLASH_Read_4B(addr, verify, 4);
+    uint32_t verify_val = (uint32_t)verify[0] | ((uint32_t)verify[1] << 8) |
+                          ((uint32_t)verify[2] << 16) | ((uint32_t)verify[3] << 24);
 
-    // OJO: 64KB erase puede tardar >5s según chip/condiciones
-    if (!FLASH_WaitBusy(30000)) {   // prueba con 30s
-        FLASH_PrintSR("[FLASH] WaitBusy timeout/fail:");
+    char dbg[100];
+    snprintf(dbg, sizeof(dbg), "[FLASH] Post-erase verify @ 0x%08lX: %02X %02X %02X %02X\r\n",
+             (unsigned long)addr, verify[0], verify[1], verify[2], verify[3]);
+    PC_Print(dbg);
+
+    if (verify_val != 0xFFFFFFFF) {
+        PC_Print("[FLASH][ERR] Sector erase FAILED - memory not cleared!\r\n");
         return false;
     }
 
-    FLASH_PrintSR("[FLASH] After ERASE done:");
+    //FLASH_PrintSR("[FLASH] After ERASE done:");
     return true;
 }
 
 bool FLASH_PageProgram(uint32_t addr, const uint8_t *data, uint32_t len) {
-	uint8_t cmd[5] = {
-	FLASH_CMD_PP, (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF,
-			(addr >> 0) & 0xFF };
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t cmd[5] = {
+            FLASH_CMD_PP,
+            (addr >> 24) & 0xFF,
+            (addr >> 16) & 0xFF,
+            (addr >> 8) & 0xFF,
+            (addr >> 0) & 0xFF
+        };
 
-	if (!FLASH_WriteEnable()){
-		PC_Print("[CAP]!FLASH_WriteEnable()\r\n");
-		return false;
-	}
+        if (!FLASH_WriteEnable()){
+            PC_Print("[CAP]!FLASH_WriteEnable()\r\n");
+            return false;
+        }
 
-	FLASH_CS_LOW();
-	if (HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK) {
-		FLASH_CS_HIGH();
-		PC_Print("[CAP] HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK\r\n");
-		return false;
-	}
-	if (HAL_SPI_Transmit(&hspi2, (uint8_t*) data, len, 200) != HAL_OK) {
-		FLASH_CS_HIGH();
-		PC_Print("[CAP] HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK\r\n");
-		return false;
-	}
-	FLASH_CS_HIGH();
+        FLASH_CS_LOW();
+        if (HAL_SPI_Transmit(&hspi2, cmd, 5, 200) != HAL_OK) {
+            FLASH_CS_HIGH();
+            return false;
+        }
+        if (HAL_SPI_Transmit(&hspi2, (uint8_t*)&data[i], 1, 200) != HAL_OK) {
+            FLASH_CS_HIGH();
+            return false;
+        }
+        FLASH_CS_HIGH();
 
-	return FLASH_WaitBusy(2000);
+        // CRÍTICO: Espera a que termine la escritura
+        if (!FLASH_WaitBusy(5000)) {
+            return false;
+        }
+
+        addr++;
+    }
+    return true;
 }
 
 static bool FLASH_WriteStatus(uint8_t sr)
@@ -1226,7 +1384,7 @@ static bool FLASH_WriteStatus(uint8_t sr)
     uint8_t cmd[2] = { 0x01, sr }; // WRSR
 
     if (!FLASH_WriteEnable()) {
-        PC_Print("[FLASH][ERR] WREN failed before WRSR\r\n");
+        //PC_Print("[FLASH][ERR] WREN failed before WRSR\r\n");
         return false;
     }
 
@@ -1300,15 +1458,31 @@ bool FLASH_WriteLogToMissionFlash(void) {
     }
     //CheckOBC_Task(5);
 
-    // 3) Header 16B (igual que tu formato)
+    // 3a) Escribir identificador "[Gyroscope]" (11 bytes)
+    uint8_t gyro_tag[11] = {'[', 'G', 'y', 'r', 'o', 's', 'c', 'o', 'p', 'e', ']'};
+    PC_Print("[CAP] Writing Gyroscope tag (11B)\r\n");
+    if (!FLASH_PageProgram(base, gyro_tag, sizeof(gyro_tag))) {
+        PC_Print("[CAP][ERR] Tag PageProgram failed\r\n");
+        flag_flash_saving = 0;
+        return false;
+    }
+
+    // DEBUG: Mostrar el tag escrito
+    uint8_t rb_tag[11] = {0};
+    FLASH_Read_4B(base, rb_tag, sizeof(rb_tag));
+    FLASH_DumpHex("[CAP][WR] TAG: ", rb_tag, sizeof(rb_tag));
+
+    // 3b) Header 16B
     uint8_t header[16] = {0};
     header[0] = (file_size & 0xFF);
     header[1] = (file_size >> 8) & 0xFF;
     header[2] = (file_size >> 16) & 0xFF;
     header[3] = (file_size >> 24) & 0xFF;
+
+    uint32_t addr_header = base + sizeof(gyro_tag);  // Después del tag
     //CheckOBC_Task(5);
     PC_Print("[CAP] Writing header (16B)\r\n");
-    if (!FLASH_PageProgram(base, header, sizeof(header))) {
+    if (!FLASH_PageProgram(addr_header, header, sizeof(header))) {  // ← AQUÍ: addr_header, no base
         PC_Print("[CAP][ERR] Header PageProgram failed\r\n");
         flag_flash_saving = 0;
         return false;
@@ -1316,13 +1490,13 @@ bool FLASH_WriteLogToMissionFlash(void) {
     //CheckOBC_Task(5);
     // --- DEBUG: readback del header ---
     uint8_t rb_hdr[16] = {0};
-    FLASH_Read_4B(base, rb_hdr, sizeof(rb_hdr));
+    FLASH_Read_4B(addr_header, rb_hdr, sizeof(rb_hdr));
 
     FLASH_DumpHex("[CAP][WR] HDR: ", header, sizeof(header));
-    FLASH_DumpHex("[CAP][RB] HDR: ", rb_hdr, sizeof(rb_hdr));
+    //FLASH_DumpHex("[CAP][RB] HDR: ", rb_hdr, sizeof(rb_hdr));
 
-    // 4) Escribir 1 muestra (t_ms + gx + gy + gz) = 10 bytes
-    uint32_t addr = base + sizeof(header);
+    // 4) Escribir 1 muestra (después del tag + header)
+    uint32_t addr = addr_header + sizeof(header);
 
     if (gyro_count == 0) {
         PC_Print("[CAP][ERR] No samples in RAM\r\n");
@@ -1374,7 +1548,11 @@ bool FLASH_WriteLogToMissionFlash(void) {
     PC_Print(dbg);
 
     FLASH_DumpHex("[CAP][WR] ROW: ", row, sizeof(row));
-    FLASH_DumpHex("[CAP][RB] ROW: ", rb_row, sizeof(rb_row));
+    //FLASH_DumpHex("[CAP][RB] ROW: ", rb_row, sizeof(rb_row));
+    // Comprehensive dump of all written data (37 bytes total)
+    uint8_t all_data[37] = {0};
+    FLASH_Read_4B(base, all_data, 37);
+    FLASH_DumpHex("[CAP][COMPLETE] ALL 37B @ 0x02C00000: ", all_data, 37);
 
     flag_flash_saving = 0;
     PC_Print("[CAP] Flash write SUCCESS\r\n");
